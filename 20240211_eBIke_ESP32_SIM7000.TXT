@@ -1,0 +1,1375 @@
+#include <Adafruit_SH1106.h>	//NB: La libreria utilizzata per la esp32 è diversa da quella per arduino 
+#include <TimeUtility.h>
+#include <Adafruit_GFX.h>
+#include <VescUart.h>
+#include <EEPROM.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_ADXL345_U.h>
+
+
+#define OLED_ADDR		0x3C
+#define OLED_SDA		21
+#define OLED_SCL		22
+
+#define ADXLaddr		0x53
+#define ADXL_SDA		21
+#define ADXL_SCL		22
+
+
+#define pinTorque				33//15//4//33			//Pin input sensore coppia movimento centrale
+#define pinPAS_mvc				32			//Pin ing. sensore pas del movimento centrale
+#define pinBtn					36//23			//Pin pulsante per sistema senza potenziometro (sensore coppia)
+#define pinBtnDWN				39//35			
+#define pinPot					12
+#define pinBtnUP				14
+#define pinBypassPed			21
+#define NumeroMagneti			6			//Numero magneti installati su corona
+#define Hall1					32
+#define Hall2					34
+#define SampleMediaADC			200			//Campioni media mobile filtro ADC potenziometro/coppia
+
+#define CurrentMax				35.0f		//Massima corrente erogabile al motore tramite comandi su UART
+#define TimeBaseAccel			100			//Tempo base (in ms) per incremento output per la gestione dell'accelerazione. Definisce la frequenza di aggiornamento del valore durante l'accelerazione 
+#define AccelerationValue		15.0f		//Ampere al secondo
+#define StartPage				8
+#define ADCdivider				3			//Divisore del valore adc per corsa potenziometro limitata
+#define maxValueADC				4095		//valore max ADC (4095 per ESP32)
+#define OffsetADC				180			//Valore di offset ADC dovuto all'inserimento della resistenza in serie al gnd del potenziometro
+#define remapMaxValueADC		(maxValueADC - OffsetADC)				
+#define EEPROM_SIZE				100
+#define CUTOFF_VOLTAGE			30.f		//Tensione soglia per il blocco dell'erogazione
+#define TORQUE_TH				10			//valore di coppia oltre la quale si attiva la trazione nella partenza da fermo (rpmPedalata = 0)
+#define CADENCE_TH				20			//Valore di cadenza al di sotto della quale viene spenta l'erogazione della spinta
+#define MIN_TORQUE_ADC_VAL		1700		//Valore minimo dell'adc del sensore di coppia
+#define MAX_TORQUE_ADC_VAL		4095		//Valore massimo dell'adc del sensore di coppia
+#define QTY_ASSIST_LEVEL		5.f			//Numero di livelli di assistanza per la modalità sensore di coppia (senza potenziometro)
+#define TICK_X_REVOLUTION_PAS   18//32			//Impulsi per rivoluzione del sensore PAS
+#define MaxVbatt				54//42
+
+#define EnableConnection
+//#define UseWifi
+#define SerialMon Serial					// Set serial for debug console (to the Serial Monitor, default speed 115200)
+#define SerialAT Serial1
+#define TINY_GSM_MODEM_SIM7000
+#define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
+#define GSM_PIN ""
+
+#define uS_TO_S_FACTOR      1000000ULL  // Conversion factor for micro seconds to seconds
+#define TIME_TO_SLEEP       60          // Time ESP32 will go to sleep (in seconds)
+
+#define UART_BAUD           115200		//uart modem
+#define PIN_DTR             25
+#define PIN_TX              27
+#define PIN_RX              26
+#define PWR_PIN             4
+
+//#define SD_MISO             2
+//#define SD_MOSI             15
+//#define SD_SCLK             14
+//#define SD_CS               13
+
+#define LED_PIN             12
+#define SEND_INTERVAL_MS	5000		//Intervallo di tempo tra un invio dati e il successivo
+
+
+#include <TinyGsmClient.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Ticker.h>
+#include <PubSubClient.h>
+#include <ArduinoHttpClient.h>
+//#include <WiFi.h>
+
+// Your GPRS credentials, if any
+const char apn[] = "shared.tids.tim.it";     //SET TO YOUR APN
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+const char server[] = "gps.tecnocons.com";
+const int port = 5055;
+String myid = "20240816EMTB";
+
+
+////WiFi 
+//const char* ssid = "RUT955_46B1";//"Infostrada-2.4Ghz";//"RUT955_46B1";//
+//const char* password = "v7MGi91B";//"3298782409";//"v7MGi91B";//
+
+// MQTT details
+const char* broker = "telemetry.tecnocons.com";//"albertomotolese.ddns.net";//"192.168.0.18";//"albertomotolese.ddns.net";
+//const char* broker = "albertomotolese.ddns.net";
+
+const char* topicTestLed = "eMTB01/TestLed";//"GsmClientTest/led";
+const char* topicStop = "eMTB01/Stop";
+const char* topicStatus = "eMTB01/Status";
+const char* topicInit = "GsmClientTest/init";
+const char* topicBatteryStatus = "eMTB01/BatteryVoltage";
+const char* topicGPSlat = "eMTB01/lat";
+const char* topicGPSlon = "eMTB01/lon";
+const char* topicGPSspeed = "eMTB01/speed";
+
+const char* topicAmpMotore = "eMTB01/AmpMotore";
+const char* topicWatt = "eMTB01/Watt";
+
+
+Adafruit_SH1106 display(OLED_SDA, OLED_SCL);	//NB: La libreria utilizzata per la esp32 è diversa da quella modificata  
+TimeTrigger timerAccel;			//temporizzatore per la gestione dell'accelerazione
+VescUart UART;
+Timer timerButton;				//timer rilevamento pressione prolungata 
+Timer timerSpecialBttFunction;	//timeout per azzerare conteggio pressioni pulsante per selezionare funzioni speciali (bypass sensore pedalata, calibrazione pot e reset
+Timer timerPotCalibration;		//Timer per la durata della procedura di calibrazione del potenziometro
+TaskHandle_t Task1;
+//TaskHandle_t Task2;
+TaskHandle_t Task3;
+TaskHandle_t Task4;
+HardwareSerial SerialVesc(2);
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(ADXLaddr);
+
+#ifdef EnableConnection
+TinyGsm modem(SerialAT);
+#ifdef UseWifi
+WiFiClient client;
+#else
+TinyGsmClient client(modem);
+#endif // UseWifi
+PubSubClient  mqtt(client);
+HttpClient http(client, server, port);
+#endif
+
+volatile float currentPitch = 0.0; //pitch dell'accelerometro
+volatile bool ADXL345present = false; // Controllo la presenza dell'accelerometro
+volatile unsigned long prevmillisPed = 0;	//per pedivella
+volatile byte RpmPedaling = 0;		//Rpm pedivella
+byte pagina = StartPage;			//pagina display
+volatile float current = 0.0f;		//Corrente mappata su potenziometro 
+volatile float sendCurrent;			//valore di corrente calcolato secondo le rampe di accelerazione e decelerazione della funzione 
+unsigned long tempo = 0;
+volatile unsigned long intervallo;
+volatile bool AbilitaTrazione = false;
+volatile int counterPAS = 0;		//Conta i segnali del sensore di pedalata
+volatile bool flagHall;				//utilizzo questa variabile per abilitare la trazione solo dopo un secondo segnale di pedalata, viene resettata dal timeout di pedalata		
+bool prevValueHall;					//flag che memorizza lo stato precedente del flagHall
+long prevmillisHall;				//
+volatile float outputUartCurrent;	//Corrente impartita alla Vesc
+volatile int FilteredADCvalue;		//Valore ADC filtrato potenziometro
+int timeout;						//Timeout rpmpedalata e trazione attiva
+bool flagSecondoSegnale = false;	//questo flag consente di abilitare la trazione solo al secondo segnale di giro pedivella
+bool SensorON = true;				//flag per attivazione/spegnimento sensore pedalata
+volatile int ADCrawValue;
+volatile int MinPot;
+volatile int MaxPot;
+volatile int testmspassed = 0;
+volatile byte Torque_0_100;			//volore potenziometro/coppia mappato su range 0-100
+volatile bool flagStop = false;		//flag di stop erogazione a batteria scarica
+byte AssistLevel = 0;				//livello di assistenza selezionato
+int ledStatus = LOW;
+uint32_t lastReconnectAttempt = 0;
+bool connectionOK = false;
+bool MQTTcommandStop = false;
+volatile float AssistLevelFLoat[6] = { 0.0f, 0.3f, 0.8f, 1.2f, 1.8f, 2.5f };
+unsigned long rpmMotor;
+float speedFromGPS = 0;
+int SignalQuality = -1;
+bool Connected = false;
+unsigned int mqttSent = 0;
+float TensioneBatt;
+
+int testcount;
+bool flagLongPressedBtt = false;
+bool Button = 0;
+bool ButtonDWN = 0;
+bool flagPressedBtt = 0;
+int CountBttSpecialFunction;
+bool ManualThrottle = false;		//flag che attiva il motore anche in assenza di pedalata, tramite pressione prolungata del tasto (tranne in modalità torque sensor)
+
+float incrementValue = AccelerationValue / (1000.0f / TimeBaseAccel);
+
+
+void calibratePitchOffset() { //Calibrazione offset pitch
+    sensors_event_t event;
+    accel.getEvent(&event);
+    float pitchOffset = atan2(event.acceleration.y, event.acceleration.z) * 180 / PI;
+    Serial.print("Pitch Offset Iniziale: ");
+    Serial.println(pitchOffset);
+}
+
+void updatePitch() {
+    sensors_event_t event;
+    accel.getEvent(&event);
+
+    // Calcolo del pitch attuale (in gradi)
+    currentPitch = atan2(event.acceleration.y, event.acceleration.z) * 180 / PI;
+}
+
+/*Gestisce la rampa di decremento corrente per drive con sensore di coppia.
+Nel caso di sensore di coppia, questa funzione garantisce un'erogazione più uniforme in quanto durante la pedalata,
+la coppia letta dal sensore ha andamento sinusoidale che risulterebbe fastidiosa
+se l'erogazione al motore seguisse esattamente il suo andamento. Pertanto nella fase di spinta sul pedale (coppia crescente)
+viene copiato il valore di corrente istantaneo calcolato a partire dal sensore;
+quando invece la coppia decresce viene attivata l'isteresi che mantiene parte dell'erogazione fino alla successiva spinta in pedalata.
+Gestisce anche gli eventuali valori fuori soglia*/
+float SmoothCurrent(float Value) {
+
+	float decrementValue = RpmPedaling / 70.f;		//proporzionale alla cadenza: aumentare il divisore per rallentare la rampa di diminuzione
+
+	if (RpmPedaling < 10 && Torque_0_100 < TORQUE_TH)	//if (RpmPedaling < CADENCE_TH && Drive_0_100 < TORQUE_TH)
+	{
+		sendCurrent = 0.0f;
+		decrementValue = 2.0;	//quando si spinge sul pedale mentre si è fermi, RpmPedaling è 0 pertanto anche decrementValue lo è: ponendolo ad un certo valore si fa in modo che il decremento (e quindi la rampa di diminuzione spinta) avvenga a rpmPedaling=0
+	}
+	else if (Value < sendCurrent)	//Coppia decrescente quindi attivo l'isteresi
+	{
+		if (timerAccel.checkTime() == 1)
+		{
+			sendCurrent = sendCurrent - decrementValue;
+		}
+	}
+	else
+	{
+		if (RpmPedaling > CADENCE_TH)
+		{
+			sendCurrent = Value;
+		}
+		else   //qui sono nella condizione partenza da fermo, utilizzo una rampa anche sull'incremento corrente per rendere più fluida la partenza
+		{
+			sendCurrent = ((sendCurrent * 20000.0f) - sendCurrent + Value) / 20000.0f;
+		}
+
+	}
+
+	//Gestione valori fuori soglia
+	if (sendCurrent > CurrentMax)
+	{
+		sendCurrent = CurrentMax;
+	}
+	else if (sendCurrent < 0.0f)
+	{
+		sendCurrent = 0.0f;
+	}
+
+	return sendCurrent;
+
+}
+
+unsigned long sumADC;
+byte indx1 = 0;
+unsigned int ptrSamplesADC[SampleMediaADC];
+/*Filtra l'ingresso ADC */
+unsigned int FilterADC(unsigned int Valore) {
+	sumADC -= ptrSamplesADC[indx1];
+	ptrSamplesADC[indx1] = Valore;
+	sumADC += ptrSamplesADC[indx1];
+	unsigned int avg = sumADC / (SampleMediaADC);
+	if (indx1 < (SampleMediaADC - 1))
+	{
+		indx1++;
+	}
+	else { indx1 = 0; }
+	return avg;
+}
+
+void drawIndicator(float radP, byte a, byte a1, float P1) {
+
+	//Vertice indicatore C
+	float cC = a * sin(radP);
+	float bC = a * cos(radP);
+	byte xC = 63 - bC;
+	byte yC = 63 - cC;
+
+	//Vertice base A
+	float cA = a1 * sin(radP + P1);
+	float bA = a1 * cos(radP + P1);
+	byte xA = 63 - bA;
+	byte yA = 63 - cA;
+
+	//Vertice base B
+	float cB = a1 * sin(radP - P1);
+	float bB = a1 * cos(radP - P1);
+	byte xB = 63 - bB;
+	byte yB = 63 - cB;
+
+	display.fillTriangle(xC, yC, xA, yA, xB, yB, WHITE);	//triangolino indicatore
+}
+
+/*Interfaccia display + output vesc*/
+void Task1code(void* pvParameter) {
+
+	SerialVesc.begin(9600, SERIAL_8N1, 19, 18);		//SerialVesc.begin(9600, SERIAL_8N1, 19, 21);
+	while (!SerialVesc) { ; }
+	UART.setSerialPort(&SerialVesc);
+
+	display.begin(SH1106_SWITCHCAPVCC, 0x3C);
+	display.setRotation(2);
+	display.clearDisplay();
+	display.setTextSize(1);
+	display.setTextColor(WHITE);
+	display.setCursor(40, 10);
+
+	display.print("rev16");
+	display.display();
+
+	int WhBatteryMap[] = { 0,32,64,91,130,260,520,689,871,1066,1222,1521,1560 };	//da 30V a 54V
+	byte percentBatt;
+
+	for (;;) {
+
+		//unsigned long uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+		//unsigned long uxHighWaterMarkmin = 1000000;
+		//if (uxHighWaterMarkmin > uxHighWaterMark)
+		//{
+		//	uxHighWaterMarkmin = uxHighWaterMark;
+		//}
+		//SerialMon.println(uxHighWaterMark);
+		UART.setCurrent(outputUartCurrent);
+		UART.getVescValues();
+
+		rpmMotor = UART.data.rpm;
+
+		TensioneBatt = ((TensioneBatt * 10.0f) - TensioneBatt + UART.data.inpVoltage) / 10.0f;		//filtro tensione 
+		if (TensioneBatt > 54.0f)
+		{
+			TensioneBatt = 54.0f;
+		}
+		if (TensioneBatt < CUTOFF_VOLTAGE)
+		{
+			flagStop == true;
+		}
+
+
+		if (TensioneBatt >= 42.f)
+		{
+			byte pos = TensioneBatt - 42;	//estraggo l'indice dell'array per la mappatura dei Watt ora
+			int decimal = (TensioneBatt - 42.f - pos) * 10.f;	//estraggo il decimale e lo moltiplico x10
+			int remainingWhBatt = map(decimal, 0, 10, WhBatteryMap[pos], WhBatteryMap[pos + 1]);	//Vado a mappare il decimale 
+			percentBatt = map(remainingWhBatt, 0, 1560, 0, 100);
+			if (percentBatt > 100)
+			{
+				percentBatt = 100;
+			}
+		}
+		else
+		{
+			percentBatt = 0;
+		}
+
+		if (pagina == 4)
+		{
+			display.clearDisplay();
+
+			byte line1 = map(outputUartCurrent * 1000, 0, CurrentMax * 1000, 0, 127);
+			byte line2 = map(Torque_0_100, 0, 100, 0, 127);
+
+			display.fillRect(0, 0, line1, 3, WHITE);
+			display.fillRect(0, 5, line2, 3, WHITE);
+
+			display.setTextSize(1);
+
+			display.setCursor(0, 10);
+			display.print("rpm Motor: ");
+			display.print(rpmMotor);
+
+			display.setCursor(0, 19);
+			display.print("GPS speed: ");
+			display.print(speedFromGPS);
+
+			display.setCursor(0, 28);
+			display.print("ConnectionOK: ");
+			display.print(connectionOK);
+
+			display.setCursor(0, 37);
+			display.print("Connected: ");
+			display.print(Connected);
+
+			display.setCursor(0, 46);
+			display.print("Signal: ");
+			display.print(SignalQuality);
+
+
+			display.setCursor(0, 55);
+			display.print("mqttSent: ");
+			display.print(mqttSent);
+
+			display.display();
+		}
+		else if (pagina == 5)
+		{
+			display.clearDisplay();
+
+			byte line1 = map(outputUartCurrent * 1000, 0, CurrentMax * 1000, 0, 127);
+			display.fillRect(0, 0, line1, 3, WHITE);
+
+			display.setTextSize(1);
+			display.setCursor(0, 6);
+			display.print("Ah: ");
+			display.print(UART.data.ampHours);
+
+			display.setCursor(0, 16);
+			display.print("Inp Curr: ");
+			display.print(UART.data.avgInputCurrent);
+
+			display.setCursor(0, 26);
+			display.print("Mot Curr: ");
+			display.print(UART.data.avgMotorCurrent);
+
+			display.setCursor(0, 36);
+			display.print("OutputUartCurr: ");
+			display.print(outputUartCurrent);
+
+			display.setCursor(0, 46);
+			display.print("V batt: ");
+			display.print(UART.data.inpVoltage);
+
+			display.setCursor(0, 56);
+			display.print("Duty: ");
+			display.print(UART.data.dutyCycleNow);
+
+			display.display();
+		}
+		else if (pagina == 6)
+		{
+			display.clearDisplay();
+
+			byte line1 = map(outputUartCurrent * 1000, 0, CurrentMax * 1000, 0, 127);
+			byte line2 = map(Torque_0_100, 0, 100, 0, 127);
+
+			display.fillRect(0, 0, line1, 3, WHITE);
+			display.fillRect(0, 5, line2, 3, WHITE);
+
+			display.setTextSize(1);
+
+			display.setCursor(0, 10);
+			display.print("Count PAS: ");
+			display.print(counterPAS);
+
+			display.setCursor(0, 19);
+			display.print("RPM Ped: ");
+			display.print(RpmPedaling);
+
+			display.setCursor(0, 28);
+			display.print("WriteCurr: ");
+			display.print(outputUartCurrent);
+
+			display.setCursor(0, 37);
+			display.print("Motor Curr: ");
+			display.print(UART.data.avgMotorCurrent);
+
+			display.setCursor(0, 46);
+			display.print("Drive %: ");
+			display.print(Torque_0_100);
+
+			display.setCursor(0, 55);
+			display.print("ADCraw: ");
+			display.print(ADCrawValue);
+
+			display.setCursor(80, 55);
+			display.print("Lvl: ");
+			display.print(AssistLevel);
+
+			display.display();
+		}
+		else if (pagina == 7)
+		{
+			display.clearDisplay();
+
+			byte line1 = map(outputUartCurrent * 1000, 0, CurrentMax * 1000, 0, 127);
+			byte line2 = map(Torque_0_100, 0, 100, 0, 127);
+
+			display.fillRect(0, 0, line1, 3, WHITE);
+			display.fillRect(0, 5, line2, 3, WHITE);
+
+			display.setTextSize(1);
+
+			display.setCursor(64, 36);
+			display.print("WATT:");
+			display.setTextSize(2);
+			display.setCursor(64, 44);
+			int watt = TensioneBatt * UART.data.avgInputCurrent;
+			display.print(watt);
+
+			display.setTextSize(1);
+			display.setCursor(64, 10);
+			display.print("AMP MOT:");
+			display.setTextSize(2);
+			display.setCursor(64, 18);
+			display.printf("%3.1f", UART.data.avgMotorCurrent);
+
+			display.setTextSize(1);
+			display.setCursor(0, 10);
+			display.print("AMP IN:");
+			display.setTextSize(2);
+			display.setCursor(0, 18);
+			display.printf("%3.1f", UART.data.avgInputCurrent);
+
+			display.setTextSize(1);
+			display.setCursor(0, 36);
+			display.print("VOLT IN:");
+			display.setTextSize(2);
+			display.setCursor(0, 44);
+			display.printf("%3.1f", TensioneBatt);
+
+			display.display();
+
+		}
+		else if (pagina == 8)
+		{
+			display.clearDisplay();
+			display.setTextSize(0);
+
+			//Barre batteria
+			byte LivelloBatt;
+			if (UART.data.avgInputCurrent < 1.0f)
+			{
+				LivelloBatt = (percentBatt) / 16; //(TensioneBatt - 30.0f + 2.4f) / 2.4f;		//map del valore da 30 a 42v su 5 barre (12/5=2.4)
+			}
+			display.drawFastVLine(0, 0, 32, WHITE);
+			switch (LivelloBatt)
+			{
+			case 6:
+				display.fillRect(0, 0, 6, 5, WHITE);
+				display.setCursor(8, 0);
+				display.print(percentBatt);
+				display.fillRect(21, 0, 50, 5, WHITE);
+				display.fillRect(0, 8, 30, 5, WHITE);
+				display.fillRect(0, 16, 20, 5, WHITE);
+				display.fillRect(0, 24, 20, 5, WHITE);
+				display.fillRect(0, 32, 10, 5, WHITE);
+				break;
+
+			case 5:
+				display.fillRect(0, 0, 6, 5, WHITE);
+				display.setCursor(8, 0);
+				display.print(percentBatt);
+				display.fillRect(21, 0, 50, 5, WHITE);
+				display.fillRect(0, 8, 30, 5, WHITE);
+				display.fillRect(0, 16, 20, 5, WHITE);
+				display.fillRect(0, 24, 20, 5, WHITE);
+				display.fillRect(0, 32, 10, 5, WHITE);
+				break;
+
+			case 4:
+				display.setCursor(8, 0);
+				display.print(percentBatt);
+				display.print("%");
+				display.fillRect(0, 8, 30, 5, WHITE);
+				display.fillRect(0, 16, 20, 5, WHITE);
+				display.fillRect(0, 24, 20, 5, WHITE);
+				display.fillRect(0, 32, 10, 5, WHITE);
+				break;
+
+			case 3:
+				display.setCursor(8, 0);
+				display.print(percentBatt);
+				display.print("%");
+				display.fillRect(0, 16, 20, 5, WHITE);
+				display.fillRect(0, 24, 20, 5, WHITE);
+				display.fillRect(0, 32, 10, 5, WHITE);
+				break;
+
+			case 2:
+				display.setCursor(8, 0);
+				display.print(percentBatt);
+				display.print("%");
+				display.fillRect(0, 24, 20, 5, WHITE);
+				display.fillRect(0, 32, 10, 5, WHITE);
+				break;
+
+			case 1:
+				display.setCursor(8, 0);
+				display.print(percentBatt);
+				display.print("%");
+				display.fillRect(0, 32, 10, 5, WHITE);
+				break;
+
+			case 0:
+				display.setCursor(8, 0);
+				display.print(percentBatt);
+				display.print("%");
+				//display.printf("%3.1f", TensioneBatt);
+				break;
+			default:
+				break;
+			}
+			display.fillCircle(63, 63, 66, BLACK);
+
+			int Watt = UART.data.inpVoltage * UART.data.avgInputCurrent;
+
+			//Elementi statici
+			display.drawCircle(63, 63, 61, WHITE);
+			display.drawCircle(63, 63, 63, WHITE);
+			display.drawFastVLine(63, 1, 5, WHITE);
+			display.drawCircle(63, 63, 28, WHITE);
+			display.drawFastVLine(63, 36, 3, WHITE);
+			display.setCursor(6, 56);
+			display.print("0");
+			display.setCursor(110, 56);
+			display.print("20");
+			display.setCursor(54, 16);
+			display.print("Amp");
+			display.setCursor(37, 56);
+			display.print("0");
+			display.setCursor(84, 56);
+			display.print("1");
+			display.setCursor(57, 45);
+			display.print("kW");
+
+			display.setCursor(110, 0);
+			display.setTextSize(2);
+			display.print(AssistLevel);
+
+			display.setTextSize(0);
+			//Ampere
+			float radA = map((UART.data.avgMotorCurrent * 100.0f), 0, (CurrentMax * 100.0f), 0, 314); //map(percentPot, 0, 100, 0, 314);
+			radA = radA / 100.0f;
+			drawIndicator(radA, 62, 34, 0.05);
+
+			//Potenza
+			float radPwr = map((Watt), 0, 1000, 0, 314);
+			radPwr = radPwr / 100.0f;
+			drawIndicator(radPwr, 26, 2, 2.2);
+
+			display.setTextSize(0);
+			if (Watt > 0)
+			{
+				display.fillRect(55, 45, 20, 10, BLACK);
+				display.setCursor(56, 46);
+				display.print(Watt);
+			}
+
+			if (UART.data.avgMotorCurrent > 1)
+			{
+				display.fillRect(54, 15, 20, 10, BLACK);
+				display.setCursor(55, 16);
+				display.printf("%3.1f", UART.data.avgMotorCurrent);
+			}
+
+			display.display();
+		}
+		else if (pagina == 20) {
+			display.clearDisplay();
+			display.setTextSize(2);
+			display.setCursor(20, 0);
+			display.print("SENSORE");
+			display.setCursor(50, 30);
+			if (SensorON == true)
+			{
+				display.print("ON");
+			}
+			else
+			{
+				display.print("OFF");
+			}
+			display.display();
+			delay(500);
+			pagina = 8;
+		}
+		else if (pagina == 31) {
+
+			display.clearDisplay();
+			display.setTextSize(0);
+			display.setCursor(20, 0);
+			display.print("CALIBRAZIONE");
+
+			display.setCursor(0, 15);
+			display.print("MIN");
+			display.setCursor(0, 25);
+			display.print(MinPot);
+
+			display.setCursor(40, 15);
+			display.print("ATTUALE");
+			display.setCursor(40, 25);
+			display.print(FilteredADCvalue);
+
+			display.setCursor(100, 15);
+			display.print("MAX");
+			display.setCursor(100, 25);
+			display.print(MaxPot);
+
+			if (timerPotCalibration.msPassed < 10000)
+			{
+				display.setCursor(8, 40);
+				display.print("Porta il pot al");
+				display.setCursor(5, 50);
+				display.print("MINIMO entro ");
+				display.print(10 - (timerPotCalibration.msPassed / 1000));
+				display.print(" sec");
+			}
+			else
+			{
+
+				display.setCursor(8, 40);
+				display.print("Porta il pot al");
+				display.setCursor(5, 50);
+				display.print("MASSIMO entro ");
+				display.print(20 - (timerPotCalibration.msPassed / 1000));
+				display.print(" sec");
+			}
+			display.display();
+
+
+		}
+		else if (pagina > 8 && pagina < 20) {	//da 20 in poi le pagine sono speciali
+			pagina = 4;
+		}
+	}
+}
+
+
+void enableGPS(void)
+{
+	SerialMon.println("Start positioning . Make sure to locate outdoors.");
+	modem.sendAT("+SGPIO=0,4,1,1");
+	if (modem.waitResponse(10000L) != 1)
+	{
+		DBG(" SGPIO=0,4,1,1 false ");
+	}
+	modem.enableGPS();
+}
+
+
+boolean mqttConnect() {
+	SerialMon.print("Connecting to ");
+	SerialMon.print(broker);
+
+	// Connect to MQTT Broker
+	//boolean status = mqtt.connect("eMTB01", "albi", "3465250784");
+	//boolean status = mqtt.connect("GsmClientNamex", "albi", "3465250784");
+	boolean status = mqtt.connect("eMTB01", "tecnocons", "nonserve");
+
+	// Or, if you want to authenticate MQTT:
+	// boolean status = mqtt.connect("GsmClientName", "mqtt_user", "mqtt_pass");
+
+	if (status == false) {
+		SerialMon.println(" fail");
+		return false;
+	}
+	SerialMon.println(" success");
+	mqtt.publish(topicInit, "GsmClientTest started");
+	mqtt.subscribe(topicTestLed);
+	mqtt.subscribe(topicStop);
+	return mqtt.connected();
+}
+
+void SendDataToTraccar(float lat, float lon)
+{
+
+	String FINALLATI = "0", FINALLOGI = "0", FINALSPEED = "0";
+	String SerialData = "";
+	SerialData = String(lat, 6);
+	String SerialData1 = "";
+	SerialData1 = String(lon, 6);
+	FINALLATI = SerialData;
+	FINALLOGI = SerialData1;
+
+	int err = http.post("/?id=" + myid + "&lat=" + FINALLATI + "&lon=" + FINALLOGI + "");
+	if (err != 0)
+	{
+		SerialMon.println(F("failed to connect"));
+		delay(10000);
+		return;
+	}
+
+	int status = http.responseStatusCode();
+
+	if (!status)
+	{
+		delay(10000);
+		return;
+	}
+
+	String body = http.responseBody();
+	SerialMon.println(F("Response:"));
+	SerialMon.println(body);
+
+	// Shutdown
+	http.stop();
+	SerialMon.println(F("Server disconnected bye bye will connect soon"));
+}
+
+
+void SendMqttDataTask() {
+
+	if (connectionOK == true) {
+
+		static unsigned long memMillisGPS = 0;
+		static float lat, lon, speed;
+		static String Coord;
+		static char charLat[10];
+		static char charLon[10];
+		static char charSpeed[10];
+		static char charCoord[20];
+		static bool GPSdataAvailable;
+		if (millis() >= memMillisGPS + SEND_INTERVAL_MS)
+		{
+			memMillisGPS = millis();
+
+			if (modem.getGPS(&lat, &lon, &speed))
+			{
+				//Serial.printf("lat:%f lon:%f\n", lat, lon);
+				String Stringlat = String(lat, 6);
+				String Stringlon = String(lon, 6);
+				String StringSpeed = String(speed, 6);
+				Stringlat.toCharArray(charLat, 10);
+				Stringlon.toCharArray(charLon, 10);
+				StringSpeed.toCharArray(charSpeed, 10);
+				Coord = Stringlat + "," + Stringlon;
+				Coord.toCharArray(charCoord, 20);
+				speedFromGPS = speed;
+				SerialMon.println("GPS data available");
+				GPSdataAvailable = true;
+			}
+			else {
+				Serial.print("no GPS data...");
+				Serial.println(millis());
+				GPSdataAvailable = false;
+				enableGPS();
+			}
+		}
+
+
+		if (!mqtt.connected()) {
+			uint32_t t = millis();
+			if (t - lastReconnectAttempt > 10000L) {
+				Serial.println("=== MQTT NOT CONNECTED ===");
+				lastReconnectAttempt = t;
+				if (mqttConnect()) { lastReconnectAttempt = 0; }
+			}
+			delay(100);
+			return;
+		}
+		else {	//se mqtt connesso
+
+			mqtt.loop();
+			//Send voltage over MQTT
+			static unsigned long memMillis = 0;
+			if (millis() >= (memMillis + SEND_INTERVAL_MS))
+			{
+				memMillis = millis();
+				String Tensione = String(UART.data.inpVoltage, 1);
+				String AmpereMotore = String(UART.data.avgMotorCurrent, 1);
+				float Watt = TensioneBatt * UART.data.avgInputCurrent;
+				String StringWatt = String(Watt, 1);
+				SerialMon.print("Sending Voltage, Amp and Watt over MQTT: ");
+				SerialMon.print(Tensione);
+				SerialMon.print("   ");
+				SerialMon.print(AmpereMotore);
+				SerialMon.print("   ");
+				SerialMon.println(StringWatt);
+
+				char charTensione[10];
+				char charAmpereMot[10];
+				char charWatt[10];
+
+				Tensione.toCharArray(charTensione, 10);
+				AmpereMotore.toCharArray(charAmpereMot, 10);
+				StringWatt.toCharArray(charWatt, 10);
+				mqtt.publish(topicBatteryStatus, charTensione);
+				mqtt.publish(topicAmpMotore, charAmpereMot);
+				mqtt.publish(topicWatt, charWatt);
+
+				//Send GPS data over MQTT
+				if (GPSdataAvailable)
+				{
+					SerialMon.print("Sending GPS data over MQTT: ");
+					SerialMon.println(Coord);
+					mqtt.publish(topicGPSlat, charLat);
+					mqtt.publish(topicGPSlon, charLon);
+					mqtt.publish(topicGPSspeed, charSpeed);
+					//mqtt.publish(topicGPScoord, charCoord);
+				}
+				mqttSent++;
+			}
+		}
+
+		static unsigned long memMillisTraccar = 0;
+		if (millis() >= memMillisTraccar + 60000)
+		{
+			memMillisTraccar = millis();
+			SendDataToTraccar(lat, lon);
+			SerialMon.println("Sending GPS data to Traccar");
+		}
+
+	}
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+	SerialMon.print("Message arrived [");
+	SerialMon.print(topic);
+	SerialMon.print("]: ");
+	SerialMon.write(payload, len);
+	SerialMon.println();
+
+	// Only proceed if incoming message's topic matches
+	if (String(topic) == topicTestLed) {
+		ledStatus = !ledStatus;
+		digitalWrite(LED_PIN, ledStatus);
+		mqtt.publish(topicStatus, ledStatus ? "1" : "0");
+	}
+
+	// Abilita/disabilita travione
+	if (String(topic) == topicStop) {
+		if (strncmp((char*)payload, "STOP", len) == 0)
+		{
+			MQTTcommandStop = true;	//togli trazione
+		}
+		if (strncmp((char*)payload, "START", len) == 0)
+		{
+			MQTTcommandStop = false;	//metti trazione
+		}
+
+
+		if (MQTTcommandStop == true)
+		{
+			mqtt.publish(topicStatus, "Ebike Stopped!");
+		}
+		else
+		{
+			mqtt.publish(topicStatus, "Ebike Operational!");
+		}
+
+	}
+
+}
+
+
+
+
+void potCalibrationRoutine(void) {
+	delay(500);
+	timerPotCalibration.startTimer();
+	int temp = analogRead(pinPot);
+	int tempMinPot;
+	int tempMaxPot;
+	bool flagbttx = false;
+	while (!(timerPotCalibration.checkTimer()) && !flagbttx)
+	{
+		temp = analogRead(pinPot);	//controllo se è stato premuttoo il pulsante, in caso affermativo esco dal ciclo while
+		if (temp > maxValueADC - 500)
+		{
+			flagbttx = true;
+		}
+		FilteredADCvalue = FilterADC(temp);
+		if (timerPotCalibration.msPassed < 10000)
+		{
+			tempMinPot = FilteredADCvalue;
+		}
+
+		if (timerPotCalibration.msPassed > 10000)
+		{
+			MinPot = tempMinPot;	//trascorsi 10 sec, aggiorno già Minpot in modo che possa già essere visualizzato su display
+			tempMaxPot = FilteredADCvalue;
+		}
+	}
+	flagbttx = false;
+	if (timerPotCalibration.checkTimer() == true)
+	{
+		MaxPot = tempMaxPot;
+		EEPROM.writeInt(0, MinPot);
+		EEPROM.writeInt(4, MaxPot);
+		EEPROM.commit();
+		delay(1500);
+	}
+
+	//Memorizzazione in eeprom
+	timerPotCalibration.resetTimer();
+	pagina = 8;
+}
+
+/*La seguente funzione rileva il verso e la frequenza della pedalata.
+Il verso viene rilevato controllando il fonte di salita del sensore hall 2: se quest'ultimo avviene e il sensore 1 è già attivo, vuol dire che
+il senso di pedalata è orario e quindi in trazione*/
+void IRAM_ATTR RilevaPedalata() {
+	counterPAS++;
+}
+
+
+
+void disableGPS(void)
+{
+	// Set SIM7000G GPIO4 LOW ,turn off GPS power
+	// CMD:AT+SGPIO=0,4,1,0
+	// Only in version 20200415 is there a function to control GPS power
+	modem.sendAT("+SGPIO=0,4,1,0");
+	if (modem.waitResponse(10000L) != 1)
+	{
+		DBG(" SGPIO=0,4,1,0 false ");
+	}
+	modem.disableGPS();
+}
+
+void modemPowerOn()
+{
+	pinMode(PWR_PIN, OUTPUT);
+	digitalWrite(PWR_PIN, LOW);
+	delay(1000);    //Datasheet Ton mintues = 1S
+	digitalWrite(PWR_PIN, HIGH);
+}
+
+void modemPowerOff()
+{
+	pinMode(PWR_PIN, OUTPUT);
+	digitalWrite(PWR_PIN, LOW);
+	delay(1500);    //Datasheet Ton mintues = 1.2S
+	digitalWrite(PWR_PIN, HIGH);
+}
+
+void modemRestart()
+{
+	modemPowerOff();
+	delay(1000);
+	modemPowerOn();
+}
+
+void ConnectTask() {
+
+	if (connectionOK == false)
+	{
+		String res;
+		Serial.println("========INIT========");
+
+		if (!modem.init()) {
+			modemRestart();
+			delay(2000);
+			Serial.println("Failed to restart modem, attempting to continue without restarting");
+			return;
+		}
+
+		Serial.println("========SIMCOMATI======");
+		modem.sendAT("+SIMCOMATI");
+		modem.waitResponse(1000L, res);
+		res.replace(GSM_NL "OK" GSM_NL, "");
+		Serial.println(res);
+		res = "";
+		Serial.println("=======================");
+
+
+		/*
+		2 Automatic
+		13 GSM only
+		38 LTE only
+		51 GSM and LTE only
+	* * * */
+		modem.setNetworkMode(13);
+
+		Serial.println("=====Preferred mode selection=====");
+		modem.sendAT("+CNMP?");
+		if (modem.waitResponse(1000L, res) == 1) {
+			res.replace(GSM_NL "OK" GSM_NL, "");
+			Serial.println(res);
+		}
+		res = "";
+		Serial.println("=======================");
+
+		/*
+		1 CAT-M
+		2 NB-Iot
+		3 CAT-M and NB-IoT
+		*/
+		modem.setPreferredMode(1);
+		Serial.println("=====Preferred selection between CAT-M and NB-IoT=====");
+		modem.sendAT("+CMNB?");
+		if (modem.waitResponse(1000L, res) == 1) {
+			res.replace(GSM_NL "OK" GSM_NL, "");
+			Serial.println(res);
+		}
+		res = "";
+		Serial.println("=======================");
+
+
+		String name = modem.getModemName();
+		Serial.println("Modem Name: " + name);
+
+		String modemInfo = modem.getModemInfo();
+		Serial.println("Modem Info: " + modemInfo);
+
+		// Unlock your SIM card with a PIN if needed
+		if (GSM_PIN && modem.getSimStatus() != 3) {
+			modem.simUnlock(GSM_PIN);
+		}
+
+		//modem.setPreferredMode(3);
+		/*
+		1 CAT-M
+		2 NB-Iot
+		3 CAT-M and NB-IoT
+		*/
+
+		for (int i = 0; i <= 4; i++) {
+			uint8_t network[] = {
+				2,  /*Automatic*/
+				13, /*GSM only*/
+				38, /*LTE only*/
+				51  /*GSM and LTE only*/
+			};
+			Serial.printf("Try %d method\n", network[i]);
+			modem.setNetworkMode(13);//modem.setNetworkMode(network[i]);
+			modem.setPreferredMode(1);
+			delay(3000);
+			bool isConnected = false;
+			int tryCount = 60;
+			while (tryCount--) {
+				int16_t signal = modem.getSignalQuality();
+				Serial.print("Signal: ");
+				Serial.print(signal);
+				Serial.print(" ");
+				Serial.print("isNetworkConnected: ");
+				isConnected = modem.isNetworkConnected();
+				Serial.println(isConnected ? "CONNECT" : "NO CONNECT");
+				if (isConnected) {
+					break;
+				}
+				delay(1000);
+				digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+			}
+			if (isConnected) {
+				break;
+			}
+		}
+		digitalWrite(LED_PIN, HIGH);
+
+		Serial.println();
+		Serial.println("Device is connected .");
+		Serial.println();
+
+		Serial.println("=====Inquiring UE system information=====");
+		modem.sendAT("+CPSI?");
+		if (modem.waitResponse(1000L, res) == 1) {
+			res.replace(GSM_NL "OK" GSM_NL, "");
+			Serial.println(res);
+		}
+
+		//************************TEST
+		SerialMon.print(F("Connecting to "));
+		SerialMon.print(apn);
+		if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+			SerialMon.println(" fail");
+			delay(10000);
+			return;
+		}
+		SerialMon.println(" success");
+
+		if (modem.isGprsConnected()) { SerialMon.println("GPRS connected"); }
+		//***********************END TEST
+
+		connectionOK = true;
+	}
+	SignalQuality = modem.getSignalQuality();
+	Connected = modem.isNetworkConnected();
+}
+
+void TestTask(void* pvParameter) {
+
+	for (;;)
+	{
+		//SignalQuality = modem.getSignalQuality();
+		//Connected = modem.isNetworkConnected();
+		//SerialMon.print("Connected: ");
+		//SerialMon.print(Connected);
+		//SerialMon.print("     ");
+		//SerialMon.print("Signal: ");
+		//SerialMon.println(SignalQuality);
+		vTaskDelay(10000 / portTICK_PERIOD_MS);
+	}
+}
+
+void TractionTask(void* pvParameter) {
+	for (;;)
+	{
+		// --- Lettura coppia --- 
+		ADCrawValue = analogRead(pinTorque);
+		FilteredADCvalue = FilterADC(ADCrawValue);
+		Torque_0_100 = constrain((map(FilteredADCvalue, MIN_TORQUE_ADC_VAL, MAX_TORQUE_ADC_VAL - 100, 0, 100)), 0, 100);
+
+		// --- Calcolo Rpm pedalata --- 
+		static int prevCounterPAS = 0;
+		unsigned long deltamillis = 0;
+		if (counterPAS > prevCounterPAS)
+		{
+			deltamillis = millis() - prevmillisHall;
+			RpmPedaling = 60000 / (deltamillis * TICK_X_REVOLUTION_PAS);
+			prevmillisHall = millis();
+			timeout = deltamillis * 3;	//tempo di timeout che porta a 0 la cadenza 
+			prevCounterPAS = counterPAS;
+		}
+		else if (millis() > prevmillisHall + timeout)
+		{
+			RpmPedaling = 0;
+		}
+
+		// --- Calcolo output ---
+		if (RpmPedaling > CADENCE_TH || Torque_0_100 > TORQUE_TH)
+		{
+			//current = (map(Drive_0_100, 0, 100, 0, CurrentMax * 1000.0f) / 1000.0f) * pow(AssistLevel, 1.2f) * 0.8;
+			current = (map(Torque_0_100, 0, 100, 0, CurrentMax * 1000.0f) / 1000.0f) * AssistLevelFLoat[AssistLevel];
+			if (current >= CurrentMax) //constrain
+			{
+				current = CurrentMax;
+			}
+		}
+		else
+		{
+			current = 0.0f;
+		}
+
+		if (MQTTcommandStop == true)
+		{
+			outputUartCurrent = 0.0f;
+		}
+		else
+		{
+			outputUartCurrent = SmoothCurrent(current);
+		}
+
+
+		// --- Gestione pulsante UP---
+		Button = digitalRead(pinBtn);
+		if (Button == true)
+		{
+			delay(50);	//filtro 
+			flagPressedBtt = true;
+			timerButton.startTimer();
+			if (timerButton.checkTimer() == true)		//Pressione prolungata
+			{
+				pagina++;
+				timerButton.resetTimer();
+				flagLongPressedBtt = true;
+			}
+		}
+
+		if (Button == false && flagPressedBtt == true)
+		{
+			flagPressedBtt = false;
+			if (flagLongPressedBtt == false)			//pressionebreve: se non è avvenuta la pressione prolungata allora rilevo quella breve
+			{
+				AssistLevel++;
+				if (AssistLevel > QTY_ASSIST_LEVEL)
+				{
+					AssistLevel = QTY_ASSIST_LEVEL;
+				}
+				CountBttSpecialFunction++;
+				timerSpecialBttFunction.startTimer();		//timeout per conteggio pressioni pulsante per selezionare la modalità di bypass pedalata
+				if (CountBttSpecialFunction > 35)
+				{
+					ESP.restart();
+				}
+			}
+			timerButton.resetTimer();
+			flagLongPressedBtt = false;
+		}
+
+		if (timerSpecialBttFunction.checkTimer() == true)
+		{
+			CountBttSpecialFunction = 0;
+			timerSpecialBttFunction.resetTimer();
+		}
+
+		//Gestione pulsante DOWN
+		ButtonDWN = digitalRead(pinBtnDWN);
+		static bool prevStateButtonDWN = false;
+		if (ButtonDWN == true)
+		{
+			delay(50);	//filtro 
+			if (prevStateButtonDWN == false)
+			{
+				prevStateButtonDWN = true;
+				if (AssistLevel > 0)
+				{
+					AssistLevel--;
+				}
+			}
+		}
+		else
+		{
+			prevStateButtonDWN = false;
+		}
+	}
+}
+
+
+
+void setup()
+{
+	//setCpuFrequencyMhz(240);
+	Serial.begin(115200);
+    if(!accel.begin()) {
+        Serial.println("ADXL345 non rilevato. Verifica connessioni!");
+        ADXL345present = false;
+    } else {
+        Serial.println("ADXL345 inizializzato correttamente.");
+		ADXL345present = true;
+		// Calibrazione iniziale per il pitch (opzionale)
+    	calibratePitchOffset();
+    }
+	//task gestione display e comunicazione seriale
+	xTaskCreatePinnedToCore(
+		Task1code, /* Function to implement the task */
+		"Task1", /* Name of the task */
+		5000,  /* Stack size in words */
+		NULL,  /* Task input parameter */
+		0,  /* Priority of the task */
+		&Task1,  /* Task handle. */
+		0); /* Core where the task should run */
+
+	pinMode(pinPAS_mvc, INPUT);
+	pinMode(pinBtn, INPUT);	//pinMode(pinBtn, INPUT_PULLDOWN);
+	pinMode(pinBtnDWN, INPUT);	//pinMode(pinBtnDWN, INPUT_PULLDOWN);
+	attachInterrupt(digitalPinToInterrupt(pinPAS_mvc), RilevaPedalata, FALLING);
+
+
+	timerAccel.setInterval(TimeBaseAccel);
+	timerButton.setTimer(400);
+	timerSpecialBttFunction.setTimer(10000);
+	timerPotCalibration.setTimer(20000);
+
+	EEPROM.begin(EEPROM_SIZE);
+	MinPot = EEPROM.readInt(0);
+	MaxPot = EEPROM.readInt(4);
+	SensorON = EEPROM.readBool(8);
+
+	//task che gestisce la trazione motore
+	xTaskCreatePinnedToCore(
+		TractionTask, /* Function to implement the task */
+		"Task4", /* Name of the task */
+		10000,  /* Stack size in words */
+		NULL,  /* Task input parameter */
+		1,  /* Priority of the task */
+		&Task4,  /* Task handle. */
+		1); /* Core where the task should run */
+
+	SerialMon.begin(115200);
+
+	pinMode(LED_PIN, OUTPUT);
+	digitalWrite(LED_PIN, HIGH);
+
+	modemPowerOn();
+	SerialMon.println("===========Modem On==============");
+	SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+
+	enableGPS();
+
+	mqtt.setServer(broker, 1883);
+	mqtt.setCallback(mqttCallback);
+
+	//task di test
+	xTaskCreatePinnedToCore(
+		TestTask, /* Function to implement the task */
+		"Task3", /* Name of the task */
+		1000,  /* Stack size in words */
+		NULL,  /* Task input parameter */
+		0,  /* Priority of the task */
+		&Task3,  /* Task handle. */
+		0); /* Core where the task should run */
+
+}
+
+
+void loop()
+{
+	ConnectTask();
+	SendMqttDataTask();
+	// Aggiorna il valore del pitch in tempo reale
+    if (ADXL345present==true) {
+		updatePitch();
+	}
+}
+
